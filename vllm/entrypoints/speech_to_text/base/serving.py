@@ -137,10 +137,72 @@ class OpenAISpeechToText(OpenAIServing):
         model_cls = get_model_cls(self.model_config)
         return cast(type[SupportsTranscription], model_cls)
 
+    @staticmethod
+    def _is_language_detection_only(
+        request: SpeechToTextRequest,
+    ) -> bool:
+        value = (request.vllm_xargs or {}).get(
+            "language_detection_only",
+            False,
+        )
+
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes"}
+
+        return False
+
+    def _get_language_candidates(
+        self,
+        request: SpeechToTextRequest,
+    ) -> list[str] | None:
+        raw = (request.vllm_xargs or {}).get("language_candidates")
+        if raw is None:
+            return None
+
+        if not isinstance(raw, str):
+            raise VLLMValidationError(
+                "language_candidates must be a comma-separated string",
+                parameter="language_candidates",
+                value=raw,
+            )
+
+        candidates = list(
+            dict.fromkeys(
+                language.strip().lower()
+                for language in raw.split(",")
+                if language.strip()
+            )
+        )
+
+        if not candidates:
+            raise VLLMValidationError(
+                "language_candidates cannot be empty",
+                parameter="language_candidates",
+                value=raw,
+            )
+
+        unsupported = [
+            language
+            for language in candidates
+            if language not in self.model_cls.supported_languages
+        ]
+        if unsupported:
+            raise VLLMValidationError(
+                f"Unsupported language candidates: {unsupported}",
+                parameter="language_candidates",
+                value=raw,
+            )
+
+        return candidates
+
     async def _detect_language(
         self,
         audio_chunk: np.ndarray,
         request_id: str,
+        language_candidates: list[str] | None = None,
     ) -> str:
         """Auto-detect the spoken language from an audio chunk.
 
@@ -154,6 +216,7 @@ class OpenAISpeechToText(OpenAIServing):
         )
         allowed_token_ids = self.model_cls.get_language_token_ids(
             self.tokenizer,
+            language_candidates
         )
         sampling_params = SamplingParams(
             max_tokens=1,
@@ -239,13 +302,43 @@ class OpenAISpeechToText(OpenAIServing):
                 min_energy_window_size=self.asr_config.min_energy_split_window_size,
             )
 
+        language_detection_only = self._is_language_detection_only(request)
+        language_candidates = self._get_language_candidates(request)
+
+        if request.language is not None and language_candidates:
+            raise VLLMValidationError(
+                "language and language_candidates cannot be used together",
+                parameter="language_candidates",
+                value=language_candidates,
+            )
+
+        if language_detection_only and request.language is not None:
+            raise VLLMValidationError(
+                "Do not specify language in language detection only mode",
+                parameter="language",
+                value=request.language,
+            )
+
+        if language_detection_only and not getattr(
+            self.model_cls,
+            "supports_explicit_language_detection",
+            False,
+        ):
+            raise VLLMValidationError(
+                "The model does not support explicit language detection",
+                parameter="language_detection_only",
+                value=True,
+            )
         if request.language is None and getattr(
             self.model_cls, "supports_explicit_language_detection", False
         ):
             # Auto-detect language from the first chunk.
             request.language = await self._detect_language(
-                chunks[0], f"{request_id}-lang_detect"
+                chunks[0], f"{request_id}-lang_detect", language_candidates
             )
+
+        if language_detection_only:
+            return [], duration
 
         parsed_prompts: list[DictPrompt] = []
         for chunk in chunks:
@@ -434,6 +527,24 @@ class OpenAISpeechToText(OpenAIServing):
             audio_data=audio_data,
             request_id=request_id,
         )
+
+        if self._is_language_detection_only(request):
+            if request.stream:
+                return self.create_error_response(
+                    "Streaming is not supported in language detection only mode"
+                )
+
+            assert request.language is not None
+
+            return cast(
+                V,
+                TranscriptionResponseVerbose(
+                    text="",
+                    language=request.language,
+                    duration=str(duration_s),
+                    segments=[],
+                ),
+            )
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len

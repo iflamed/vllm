@@ -553,6 +553,7 @@ class Qwen3ASRForConditionalGeneration(
         """Get the generation prompt to be used for transcription requests."""
         audio = stt_params.audio
         model_config = stt_params.model_config
+        language = stt_params.language
         task_type = stt_params.task_type
         to_language = stt_params.to_language
         tokenizer = cached_tokenizer_from_config(model_config)
@@ -563,17 +564,16 @@ class Qwen3ASRForConditionalGeneration(
                 f"Unsupported task_type '{task_type}'. "
                 "Supported task types are 'transcribe' and 'translate'."
             )
-        full_lang_name_to = cls.supported_languages.get(to_language, to_language)
-        if to_language is None:
-            prompt = (
-                f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
-        else:
-            prompt = (
-                f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
-                f"<|im_start|>assistant\nlanguage {full_lang_name_to}{_ASR_TEXT_TAG}"
-            )
+
+        prompt = (
+            f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+        lang_code = to_language if task_type == "translate" else language
+        if lang_code is not None:
+            full_lang_name = cls.supported_languages.get(lang_code, lang_code)
+            prompt += f"language {full_lang_name}{_ASR_TEXT_TAG}"
 
         prompt_token_ids = tokenizer.encode(prompt)
 

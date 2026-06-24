@@ -597,5 +597,6 @@ class Qwen3ASRForConditionalGeneration(
             return text
 
         # Split on <asr_text> tag and take the transcription part
-        _, text_part = text.rsplit(_ASR_TEXT_TAG, 1)
-        return text_part
+        lang_part, text_part = text.rsplit(_ASR_TEXT_TAG, 1)
+        lang = lang_part.replace("language ", "").strip()
+        return f"[{lang}] {text_part}"
